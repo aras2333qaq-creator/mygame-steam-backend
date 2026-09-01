@@ -54,9 +54,10 @@ app.get('/auth/steam/callback', async (req,res) => {
     const claimed=String(req.query['openid.claimed_id']||'');
     const m=claimed.match(/\/id\/(\d{17})$/); if(!m) throw new Error('SteamID missing');
 res.send(`
-  <h1>Steam 登录成功！</h1>
-  <p>SteamID: ${m[1]}</p>
-`);  } catch(e) { res.redirect(`${item.scheme}://steam/callback?error=${encodeURIComponent(e.message||'login_failed')}`); }
+ const target =
+  `${item.scheme}://steam/callback?steamId=${encodeURIComponent(m[1])}`;
+
+res.redirect(target); } catch(e) { res.redirect(`${item.scheme}://steam/callback?error=${encodeURIComponent(e.message||'login_failed')}`); }
 });
 
 app.get('/steam-games', async (req,res) => {
