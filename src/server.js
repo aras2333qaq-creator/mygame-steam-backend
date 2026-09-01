@@ -8,8 +8,16 @@ const app = express();
 const port = Number(process.env.PORT || 3000);
 const apiKey = process.env.STEAM_API_KEY;
 const baseUrl = (process.env.BASE_URL || '').replace(/\/$/, '');
-if (!apiKey || !baseUrl) { console.error('Missing STEAM_API_KEY or BASE_URL in .env'); process.exit(1); }
 
+console.log('Environment check:');
+console.log('PORT exists:', !!process.env.PORT);
+console.log('STEAM_API_KEY exists:', !!apiKey);
+console.log('BASE_URL value:', baseUrl || '(EMPTY)');
+
+if (!apiKey || !baseUrl) {
+  console.error('Missing environment variable');
+  process.exit(1);
+}
 app.set('trust proxy', 1);
 app.use(express.json());
 app.use(cors());
