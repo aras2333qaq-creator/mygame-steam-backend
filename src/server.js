@@ -217,20 +217,25 @@ app.get('/steam-games', async (req, res) => {
     if (!ownedResp.ok) throw new Error(`Steam HTTP ${ownedResp.status}`);
     const ownedData = await ownedResp.json();
     const recentData = recentResp.ok ? await recentResp.json() : {};
-    // 最近运行接口同时提供 Steam 官方的最后运行时间 rtime_last_played（Unix 秒）。
-    // 不再把导入 App 的时间误当成游戏最后运行时间。
+    // Steam 官方最后运行时间优先级：GetOwnedGames -> GetRecentlyPlayedGames -> null。
+    // 绝不使用 App 导入时间或 createdAt 伪造最后运行时间。
     const recentMap = new Map((recentData.response?.games || []).map(g => [g.appid, {
-      playtime_2weeks: g.playtime_2weeks || 0,
-      rtime_last_played: g.rtime_last_played || null,
+      playtime_2weeks: Number(g.playtime_2weeks || 0),
+      rtime_last_played: Number(g.rtime_last_played || 0) || null,
     }]));
     const baseGames = (ownedData.response?.games || []).map(g => {
       const recent = recentMap.get(g.appid) || {};
+      const ownedLastPlayed = Number(g.rtime_last_played || 0);
+      const recentLastPlayed = Number(recent.rtime_last_played || 0);
+      const rtime_last_played = ownedLastPlayed > 0
+        ? ownedLastPlayed
+        : (recentLastPlayed > 0 ? recentLastPlayed : null);
       return {
         appid: g.appid,
         name: g.name,
-        playtime_forever: g.playtime_forever || 0,
-        playtime_2weeks: recent.playtime_2weeks || 0,
-        rtime_last_played: recent.rtime_last_played || null,
+        playtime_forever: Number(g.playtime_forever || 0),
+        playtime_2weeks: Number(recent.playtime_2weeks || 0),
+        rtime_last_played,
       };
     });
     // Achievements are intentionally concurrent but bounded so Railway does not stall on large libraries.
