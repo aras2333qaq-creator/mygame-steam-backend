@@ -8,16 +8,8 @@ const app = express();
 const port = Number(process.env.PORT || 3000);
 const apiKey = process.env.STEAM_API_KEY;
 const baseUrl = (process.env.BASE_URL || '').replace(/\/$/, '');
+if (!apiKey || !baseUrl) { console.error('Missing STEAM_API_KEY or BASE_URL in .env'); process.exit(1); }
 
-console.log('Environment check:');
-console.log('PORT exists:', !!process.env.PORT);
-console.log('STEAM_API_KEY exists:', !!apiKey);
-console.log('BASE_URL value:', baseUrl || '(EMPTY)');
-
-if (!apiKey || !baseUrl) {
-  console.error('Missing environment variable');
-  process.exit(1);
-}
 app.set('trust proxy', 1);
 app.use(express.json());
 app.use(cors());
@@ -38,7 +30,7 @@ app.get('/auth/steam/start', (req,res) => {
     'openid.identity':'http://specs.openid.net/auth/2.0/identifier_select',
     'openid.claimed_id':'http://specs.openid.net/auth/2.0/identifier_select'
   });
-  res.redirect(`https://steamcommunity.com/openid/login?${q}`);
+  res.redirect(`https://steamcommunity.com/openid/?${q}`);
 });
 
 app.get('/auth/steam/callback', async (req,res) => {
@@ -53,22 +45,47 @@ app.get('/auth/steam/callback', async (req,res) => {
     if(!text.includes('is_valid:true')) throw new Error('OpenID verification failed');
     const claimed=String(req.query['openid.claimed_id']||'');
     const m=claimed.match(/\/id\/(\d{17})$/); if(!m) throw new Error('SteamID missing');
-res.send(`
- const target =
-  `${item.scheme}://steam/callback?steamId=${encodeURIComponent(m[1])}`;
-
-res.redirect(target); } catch(e) { res.redirect(`${item.scheme}://steam/callback?error=${encodeURIComponent(e.message||'login_failed')}`); }
+    const target=`${item.scheme}://steam/callback?steamId=${encodeURIComponent(m[1])}`;
+    res.redirect(target);
+  } catch(e) { res.redirect(`${item.scheme}://steam/callback?error=${encodeURIComponent(e.message||'login_failed')}`); }
 });
+
+async function fetchAchievements(steamId, appid) {
+  try {
+    const u=new URL('https://api.steampowered.com/ISteamUserStats/GetPlayerAchievements/v0001/');
+    u.searchParams.set('key',apiKey); u.searchParams.set('steamid',steamId); u.searchParams.set('appid',String(appid));
+    const r=await fetch(u); if(!r.ok) return {achievement_unlocked:0,achievement_total:0};
+    const data=await r.json(); const achievements=data.playerstats?.achievements;
+    if(!Array.isArray(achievements)) return {achievement_unlocked:0,achievement_total:0};
+    return {achievement_unlocked:achievements.filter(a=>Number(a.achieved)===1).length,achievement_total:achievements.length};
+  } catch (_) { return {achievement_unlocked:0,achievement_total:0}; }
+}
+
+async function mapWithConcurrency(items, limit, mapper) {
+  const out=new Array(items.length); let next=0;
+  const workers=Array.from({length:Math.min(limit,items.length)}, async()=>{
+    while(true){ const i=next++; if(i>=items.length) break; out[i]=await mapper(items[i]); }
+  });
+  await Promise.all(workers); return out;
+}
 
 app.get('/steam-games', async (req,res) => {
   const steamId=String(req.query.steamId||'').trim();
   if(!/^7656119\d{10}$/.test(steamId)) return res.status(400).json({error:'Invalid Steam ID'});
   try {
-    const u=new URL('https://api.steampowered.com/IPlayerService/GetOwnedGames/v0001/');
-    u.searchParams.set('key',apiKey);u.searchParams.set('steamid',steamId);u.searchParams.set('include_appinfo','true');u.searchParams.set('include_played_free_games','true');
-    const r=await fetch(u);if(!r.ok) throw new Error(`Steam HTTP ${r.status}`);const data=await r.json();
-    const games=(data.response?.games||[]).map(g=>({appid:g.appid,name:g.name,playtime_forever:g.playtime_forever||0})).sort((a,b)=>b.playtime_forever-a.playtime_forever);
-    res.json({games,count:games.length});
+    const ownedUrl=new URL('https://api.steampowered.com/IPlayerService/GetOwnedGames/v0001/');
+    ownedUrl.searchParams.set('key',apiKey);ownedUrl.searchParams.set('steamid',steamId);ownedUrl.searchParams.set('include_appinfo','true');ownedUrl.searchParams.set('include_played_free_games','true');
+    const recentUrl=new URL('https://api.steampowered.com/IPlayerService/GetRecentlyPlayedGames/v0001/');
+    recentUrl.searchParams.set('key',apiKey);recentUrl.searchParams.set('steamid',steamId);
+    const [ownedResp,recentResp]=await Promise.all([fetch(ownedUrl),fetch(recentUrl)]);
+    if(!ownedResp.ok) throw new Error(`Steam HTTP ${ownedResp.status}`);
+    const ownedData=await ownedResp.json();
+    const recentData=recentResp.ok?await recentResp.json():{};
+    const recentMap=new Map((recentData.response?.games||[]).map(g=>[g.appid,g.playtime_2weeks||0]));
+    const baseGames=(ownedData.response?.games||[]).map(g=>({appid:g.appid,name:g.name,playtime_forever:g.playtime_forever||0,playtime_2weeks:recentMap.get(g.appid)||0}));
+    const games=await mapWithConcurrency(baseGames, 8, async g=>({...g,...await fetchAchievements(steamId,g.appid)}));
+    games.sort((a,b)=>b.playtime_forever-a.playtime_forever);
+    res.json({games,count:games.length,achievementsSynced:true});
   } catch(e){res.status(502).json({error:'Unable to fetch Steam library',detail:e.message});}
 });
 
