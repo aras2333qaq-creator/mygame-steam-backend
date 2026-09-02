@@ -1,19 +1,9 @@
 # MyGame Steam Backend
 
-## Required environment
+## Railway environment variables
 
-Copy `.env.example` to `.env` and set:
+Set `STEAM_API_KEY` in Railway. `PORT` is provided automatically by Railway.
 
-- `BASE_URL`: public HTTPS URL of this backend (required by Steam OpenID).
-- `STEAM_API_KEY`: Steam Web API key. Keep it on the server only.
+`BASE_URL` is optional: if omitted, the backend automatically uses the public Railway request URL, which avoids a deployment crash caused by an outdated or missing domain.
 
-## Run
-
-```bash
-npm install
-npm start
-```
-
-The Flutter app opens `/auth/steam/start?returnScheme=mygame`. Steam authenticates in the browser, this server verifies OpenID with Steam, extracts the 64-bit SteamID, then redirects to `mygame://steam/callback?steamId=...`.
-
-For local development, Steam OpenID callback must still be reachable at the public `BASE_URL`; use a secure public HTTPS tunnel if necessary.
+After deployment, open `/health`. It should return `ok: true` before testing Steam login.
