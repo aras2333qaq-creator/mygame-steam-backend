@@ -82,7 +82,7 @@ app.get('/auth/steam/start', (req, res) => {
       'openid.identity': 'http://specs.openid.net/auth/2.0/identifier_select',
       'openid.claimed_id': 'http://specs.openid.net/auth/2.0/identifier_select'
     });
-    return res.redirect(`https://steamcommunity.com/openid/?${q}`);
+    return res.redirect(302, `https://steamcommunity.com/openid/login?${q.toString()}`);
   } catch (e) {
     return res.status(500).send(`Steam login setup failed: ${e.message || 'unknown error'}`);
   }
