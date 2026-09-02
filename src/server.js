@@ -236,6 +236,7 @@ app.get('/steam-games', async (req, res) => {
         playtime_forever: Number(g.playtime_forever || 0),
         playtime_2weeks: Number(recent.playtime_2weeks || 0),
         rtime_last_played,
+        last_played_source: ownedLastPlayed > 0 ? 'owned' : (recentLastPlayed > 0 ? 'recent' : 'steam_unavailable'),
       };
     });
     // Achievements are intentionally concurrent but bounded so Railway does not stall on large libraries.
@@ -245,6 +246,40 @@ app.get('/steam-games', async (req, res) => {
   } catch (e) {
     return res.status(502).json({ error: 'Unable to fetch Steam library', detail: e.message || 'Unknown error' });
   }
+});
+
+app.get('/debug-steam-last-played', async (req, res) => {
+  const steamId = String(req.query.steamId || '').trim();
+  if (!/^7656119\d{10}$/.test(steamId)) return res.status(400).json({ error: 'Invalid Steam ID' });
+  if (!requireSteamKey(res)) return;
+  try {
+    const ownedUrl = new URL('https://api.steampowered.com/IPlayerService/GetOwnedGames/v0001/');
+    ownedUrl.searchParams.set('key', apiKey); ownedUrl.searchParams.set('steamid', steamId);
+    ownedUrl.searchParams.set('include_appinfo', 'true'); ownedUrl.searchParams.set('include_played_free_games', 'true');
+    const recentUrl = new URL('https://api.steampowered.com/IPlayerService/GetRecentlyPlayedGames/v0001/');
+    recentUrl.searchParams.set('key', apiKey); recentUrl.searchParams.set('steamid', steamId);
+    const [ownedResp, recentResp] = await Promise.all([fetchWithTimeout(ownedUrl, {}, 25000), fetchWithTimeout(recentUrl, {}, 25000)]);
+    const ownedData = ownedResp.ok ? await ownedResp.json() : {};
+    const recentData = recentResp.ok ? await recentResp.json() : {};
+    const ownedGames = ownedData.response?.games || [];
+    const recentGames = recentData.response?.games || [];
+    const ownedWithLastPlayed = ownedGames.filter(g => Number(g.rtime_last_played || 0) > 0);
+    const recentWithLastPlayed = recentGames.filter(g => Number(g.rtime_last_played || 0) > 0);
+    const ownedMap = new Map(ownedGames.map(g => [g.appid, g]));
+    const recentMap = new Map(recentGames.map(g => [g.appid, g]));
+    const summarize = g => ({ appid:g.appid, name:g.name, rtime_last_played:g.rtime_last_played ?? null, keys:Object.keys(g) });
+    const crossSamples = recentGames.slice(0, 20).map(r => {
+      const o = ownedMap.get(r.appid) || {};
+      return { appid:r.appid, name:r.name || o.name, owned_rtime_last_played:o.rtime_last_played ?? null, recent_rtime_last_played:r.rtime_last_played ?? null, owned_keys:Object.keys(o), recent_keys:Object.keys(r) };
+    });
+    return res.json({
+      steamId,
+      owned: { httpStatus: ownedResp.status, count: ownedGames.length, withRtimeLastPlayed: ownedWithLastPlayed.length, samplesWithRtimeLastPlayed: ownedWithLastPlayed.slice(0, 20).map(summarize), samplesWithoutRtimeLastPlayed: ownedGames.filter(g => !Number(g.rtime_last_played || 0)).slice(0, 10).map(summarize) },
+      recent: { httpStatus: recentResp.status, count: recentGames.length, withRtimeLastPlayed: recentWithLastPlayed.length, samplesWithRtimeLastPlayed: recentWithLastPlayed.slice(0, 20).map(summarize), samplesWithoutRtimeLastPlayed: recentGames.filter(g => !Number(g.rtime_last_played || 0)).slice(0, 10).map(summarize) },
+      crossSamples,
+      interpretation: (ownedWithLastPlayed.length || recentWithLastPlayed.length) ? 'steam_returned_rtime_last_played' : 'steam_did_not_return_rtime_last_played'
+    });
+  } catch (e) { return res.status(502).json({ error:'Steam diagnostic failed', detail:e.message || 'Unknown error' }); }
 });
 
 app.listen(port, '0.0.0.0', () => console.log(`MyGame Steam backend listening on :${port}`));
