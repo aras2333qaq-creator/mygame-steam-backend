@@ -111,19 +111,91 @@ app.get('/auth/steam/callback', async (req, res) => {
   }
 });
 
-async function fetchAchievements(steamId, appid) {
-  try {
-    const u = new URL('https://api.steampowered.com/ISteamUserStats/GetPlayerAchievements/v0001/');
-    u.searchParams.set('key', apiKey); u.searchParams.set('steamid', steamId); u.searchParams.set('appid', String(appid));
-    const r = await fetchWithTimeout(u, {}, 10_000);
-    if (!r.ok) return { achievement_unlocked: 0, achievement_total: 0 };
-    const data = await r.json();
-    const achievements = data.playerstats?.achievements;
-    if (!Array.isArray(achievements)) return { achievement_unlocked: 0, achievement_total: 0 };
-    return { achievement_unlocked: achievements.filter(a => Number(a.achieved) === 1).length, achievement_total: achievements.length };
-  } catch (_) { return { achievement_unlocked: 0, achievement_total: 0 }; }
+async function fetchJson(url, timeoutMs = 12_000) {
+  const r = await fetchWithTimeout(url, {}, timeoutMs);
+  if (!r.ok) throw new Error(`HTTP ${r.status}`);
+  return await r.json();
 }
 
+// Steam 玩家成就 + 商店公开成就定义。
+// 玩家接口负责已解锁状态/时间，商店接口负责中文名称、描述和图标。
+// 任一接口不可用时仍尽可能返回已有数据，避免整个游戏库导入失败。
+async function fetchAchievements(steamId, appid) {
+  const empty = { achievement_unlocked: 0, achievement_total: 0, achievements: [] };
+  if (!apiKey) return empty;
+
+  let playerAchievements = [];
+  try {
+    const u = new URL('https://api.steampowered.com/ISteamUserStats/GetPlayerAchievements/v0001/');
+    u.searchParams.set('key', apiKey);
+    u.searchParams.set('steamid', steamId);
+    u.searchParams.set('appid', String(appid));
+    u.searchParams.set('l', 'schinese');
+    const data = await fetchJson(u, 10_000);
+    playerAchievements = Array.isArray(data.playerstats?.achievements)
+      ? data.playerstats.achievements : [];
+  } catch (_) {
+    // 私有资料、无成就或 Steam 临时失败都不阻断游戏库导入。
+    return empty;
+  }
+
+  const unlocked = playerAchievements.filter(a => Number(a.achieved) === 1).length;
+  const byApiName = new Map();
+  for (const a of playerAchievements) byApiName.set(String(a.apiname || a.name || ''), a);
+
+  let definitions = [];
+  try {
+    // Store API 不需要 Steam Web API Key，可提供图标/名称/描述。
+    const storeUrl = new URL('https://store.steampowered.com/api/appdetails');
+    storeUrl.searchParams.set('appids', String(appid));
+    storeUrl.searchParams.set('l', 'schinese');
+    const storeData = await fetchJson(storeUrl, 10_000);
+    const appData = storeData?.[String(appid)]?.data;
+    definitions = Array.isArray(appData?.achievements?.highlighted)
+      ? appData.achievements.highlighted : [];
+
+    // highlighted 只返回部分成就，因此优先再请求完整 Schema。
+    if (definitions.length < playerAchievements.length) {
+      const schemaUrl = new URL('https://api.steampowered.com/ISteamUserStats/GetSchemaForGame/v2/');
+      schemaUrl.searchParams.set('key', apiKey);
+      schemaUrl.searchParams.set('appid', String(appid));
+      schemaUrl.searchParams.set('l', 'schinese');
+      const schema = await fetchJson(schemaUrl, 10_000);
+      const schemaAchievements = schema.game?.availableGameStats?.achievements;
+      if (Array.isArray(schemaAchievements) && schemaAchievements.length) definitions = schemaAchievements;
+    }
+  } catch (_) {
+    // 后续会退回 API 名称，确保状态至少可以导入。
+  }
+
+  const meta = new Map();
+  for (const d of definitions) {
+    const key = String(d.name || d.apiname || '');
+    if (key) meta.set(key, d);
+  }
+
+  const achievements = playerAchievements.map((a, index) => {
+    const key = String(a.apiname || a.name || '');
+    const d = meta.get(key) || {};
+    const achieved = Number(a.achieved) === 1;
+    const unlockUnix = Number(a.unlocktime || 0);
+    return {
+      id: key || `achievement_${index}`,
+      name: String(d.displayName || d.name || a.name || a.apiname || '未知成就'),
+      description: String(d.description || ''),
+      icon: String(d.icon || d.iconClosed || ''),
+      unlocked: achieved,
+      achieved: achieved ? 1 : 0,
+      unlockTime: unlockUnix > 0 ? new Date(unlockUnix * 1000).toISOString() : null
+    };
+  });
+
+  return {
+    achievement_unlocked: unlocked,
+    achievement_total: playerAchievements.length,
+    achievements
+  };
+}
 async function mapWithConcurrency(items, limit, mapper) {
   const out = new Array(items.length); let next = 0;
   const workers = Array.from({ length: Math.min(limit, items.length) }, async () => {
@@ -145,10 +217,24 @@ app.get('/steam-games', async (req, res) => {
     if (!ownedResp.ok) throw new Error(`Steam HTTP ${ownedResp.status}`);
     const ownedData = await ownedResp.json();
     const recentData = recentResp.ok ? await recentResp.json() : {};
-    const recentMap = new Map((recentData.response?.games || []).map(g => [g.appid, g.playtime_2weeks || 0]));
-    const baseGames = (ownedData.response?.games || []).map(g => ({ appid: g.appid, name: g.name, playtime_forever: g.playtime_forever || 0, playtime_2weeks: recentMap.get(g.appid) || 0 }));
+    // 最近运行接口同时提供 Steam 官方的最后运行时间 rtime_last_played（Unix 秒）。
+    // 不再把导入 App 的时间误当成游戏最后运行时间。
+    const recentMap = new Map((recentData.response?.games || []).map(g => [g.appid, {
+      playtime_2weeks: g.playtime_2weeks || 0,
+      rtime_last_played: g.rtime_last_played || null,
+    }]));
+    const baseGames = (ownedData.response?.games || []).map(g => {
+      const recent = recentMap.get(g.appid) || {};
+      return {
+        appid: g.appid,
+        name: g.name,
+        playtime_forever: g.playtime_forever || 0,
+        playtime_2weeks: recent.playtime_2weeks || 0,
+        rtime_last_played: recent.rtime_last_played || null,
+      };
+    });
     // Achievements are intentionally concurrent but bounded so Railway does not stall on large libraries.
-    const games = await mapWithConcurrency(baseGames, 4, async g => ({ ...g, ...await fetchAchievements(steamId, g.appid) }));
+    const games = await mapWithConcurrency(baseGames, 6, async g => ({ ...g, ...await fetchAchievements(steamId, g.appid) }));
     games.sort((a, b) => b.playtime_forever - a.playtime_forever);
     return res.json({ games, count: games.length, achievementsSynced: true });
   } catch (e) {
