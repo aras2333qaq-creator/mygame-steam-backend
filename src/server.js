@@ -46,7 +46,24 @@ async function fetchWithTimeout(url, options = {}, timeoutMs = 15_000) {
   }
 }
 
-app.get('/', (_, res) => res.json({ ok: true, service: 'mygame-steam-backend' }));
+app.get('/', (_, res) => {
+  res
+    .status(200)
+    .type('html')
+    .send(`<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>MyGame Steam Backend</title>
+</head>
+<body>
+  <h1>MyGame Steam Backend</h1>
+  <p>Backend is running successfully.</p>
+  <p><a href="/health">Health Check</a></p>
+</body>
+</html>`);
+});
 app.get('/health', (_, res) => res.status(200).json({ ok: true, service: 'mygame-steam-backend', steamConfigured: Boolean(apiKey), baseUrlConfigured: Boolean(configuredBaseUrl) }));
 
 app.get('/auth/steam/start', (req, res) => {
