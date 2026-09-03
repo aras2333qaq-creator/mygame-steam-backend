@@ -285,6 +285,8 @@ app.post('/steam-games/sync', async (req, res) => {
       unchangedCount: baseGames.length - games.length,
       achievementsSynced: true,
       profile,
+      lastPlayedAvailableCount: baseGames.filter(g => Number(g.rtime_last_played || 0) > 0).length,
+      lastPlayedUnavailableCount: baseGames.filter(g => !Number(g.rtime_last_played || 0)).length,
       mode: 'incremental'
     });
   } catch (e) {
