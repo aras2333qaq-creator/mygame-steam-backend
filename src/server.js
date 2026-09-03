@@ -111,6 +111,32 @@ app.get('/auth/steam/callback', async (req, res) => {
   }
 });
 
+
+async function fetchSteamProfile(steamId) {
+  if (!apiKey) return {};
+  const summaryUrl = new URL('https://api.steampowered.com/ISteamUser/GetPlayerSummaries/v0002/');
+  summaryUrl.searchParams.set('key', apiKey); summaryUrl.searchParams.set('steamids', steamId);
+  const levelUrl = new URL('https://api.steampowered.com/IPlayerService/GetSteamLevel/v1/');
+  levelUrl.searchParams.set('key', apiKey); levelUrl.searchParams.set('steamid', steamId);
+  const [summaryResp, levelResp] = await Promise.all([
+    fetchWithTimeout(summaryUrl, {}, 12_000), fetchWithTimeout(levelUrl, {}, 12_000)
+  ]);
+  const summaryData = summaryResp.ok ? await summaryResp.json() : {};
+  const levelData = levelResp.ok ? await levelResp.json() : {};
+  const player = summaryData.response?.players?.[0] || {};
+  return {
+    steamid: steamId,
+    personaname: player.personaname || '',
+    avatar: player.avatarfull || player.avatarmedium || player.avatar || '',
+    avatarfull: player.avatarfull || '',
+    profileurl: player.profileurl || '',
+    realname: player.realname || '',
+    level: Number(levelData.response?.player_level || 0) || null,
+    communityvisibilitystate: player.communityvisibilitystate ?? null,
+    lastlogoff: player.lastlogoff ?? null
+  };
+}
+
 async function fetchJson(url, timeoutMs = 12_000) {
   const r = await fetchWithTimeout(url, {}, timeoutMs);
   if (!r.ok) throw new Error(`HTTP ${r.status}`);
@@ -204,6 +230,68 @@ async function mapWithConcurrency(items, limit, mapper) {
   await Promise.all(workers); return out;
 }
 
+
+// 增量同步：客户端提交上次同步时保存的游戏指纹。
+// 后端仍从 Steam 获取当前拥有游戏列表以判断变化，但只有新增/变化游戏才请求成就详情并返回，
+// 从而避免每次刷新都重新导入全部游戏和对每个游戏重复请求成就接口。
+app.post('/steam-games/sync', async (req, res) => {
+  const steamId = String(req.query.steamId || '').trim();
+  if (!/^7656119\d{10}$/.test(steamId)) return res.status(400).json({ error: 'Invalid Steam ID' });
+  if (!requireSteamKey(res)) return;
+  const knownRaw = req.body?.knownGames;
+  const knownGames = knownRaw && typeof knownRaw === 'object' && !Array.isArray(knownRaw) ? knownRaw : {};
+  try {
+    const ownedUrl = new URL('https://api.steampowered.com/IPlayerService/GetOwnedGames/v0001/');
+    ownedUrl.searchParams.set('key', apiKey); ownedUrl.searchParams.set('steamid', steamId);
+    ownedUrl.searchParams.set('include_appinfo', 'true'); ownedUrl.searchParams.set('include_played_free_games', 'true');
+    const recentUrl = new URL('https://api.steampowered.com/IPlayerService/GetRecentlyPlayedGames/v0001/');
+    recentUrl.searchParams.set('key', apiKey); recentUrl.searchParams.set('steamid', steamId);
+    const [ownedResp, recentResp, profile] = await Promise.all([
+      fetchWithTimeout(ownedUrl, {}, 25_000),
+      fetchWithTimeout(recentUrl, {}, 25_000),
+      fetchSteamProfile(steamId).catch(() => ({ steamid: steamId }))
+    ]);
+    if (!ownedResp.ok) throw new Error(`Steam HTTP ${ownedResp.status}`);
+    const ownedData = await ownedResp.json();
+    const recentData = recentResp.ok ? await recentResp.json() : {};
+    const recentMap = new Map((recentData.response?.games || []).map(g => [g.appid, {
+      playtime_2weeks: Number(g.playtime_2weeks || 0),
+      rtime_last_played: Number(g.rtime_last_played || 0) || null,
+    }]));
+    const baseGames = (ownedData.response?.games || []).map(g => {
+      const recent = recentMap.get(g.appid) || {};
+      const ownedLastPlayed = Number(g.rtime_last_played || 0);
+      const recentLastPlayed = Number(recent.rtime_last_played || 0);
+      const rtime_last_played = ownedLastPlayed > 0 ? ownedLastPlayed : (recentLastPlayed > 0 ? recentLastPlayed : null);
+      // 指纹只由 Steam 库中会影响本地展示的轻量字段组成。
+      const sync_fingerprint = `${g.appid}|${Number(g.playtime_forever || 0)}|${Number(recent.playtime_2weeks || 0)}|${rtime_last_played || 0}`;
+      return {
+        appid: g.appid,
+        name: g.name,
+        playtime_forever: Number(g.playtime_forever || 0),
+        playtime_2weeks: Number(recent.playtime_2weeks || 0),
+        rtime_last_played,
+        last_played_source: ownedLastPlayed > 0 ? 'owned' : (recentLastPlayed > 0 ? 'recent' : 'steam_unavailable'),
+        sync_fingerprint,
+      };
+    });
+    const changedBase = baseGames.filter(g => String(knownGames[String(g.appid)] || '') !== g.sync_fingerprint);
+    const games = await mapWithConcurrency(changedBase, 6, async g => ({ ...g, ...await fetchAchievements(steamId, g.appid) }));
+    games.sort((a, b) => b.playtime_forever - a.playtime_forever);
+    return res.json({
+      games,
+      count: baseGames.length,
+      changedCount: games.length,
+      unchangedCount: baseGames.length - games.length,
+      achievementsSynced: true,
+      profile,
+      mode: 'incremental'
+    });
+  } catch (e) {
+    return res.status(502).json({ error: 'Unable to sync Steam library', detail: e.message || 'Unknown error' });
+  }
+});
+
 app.get('/steam-games', async (req, res) => {
   const steamId = String(req.query.steamId || '').trim();
   if (!/^7656119\d{10}$/.test(steamId)) return res.status(400).json({ error: 'Invalid Steam ID' });
@@ -213,7 +301,7 @@ app.get('/steam-games', async (req, res) => {
     ownedUrl.searchParams.set('key', apiKey); ownedUrl.searchParams.set('steamid', steamId); ownedUrl.searchParams.set('include_appinfo', 'true'); ownedUrl.searchParams.set('include_played_free_games', 'true');
     const recentUrl = new URL('https://api.steampowered.com/IPlayerService/GetRecentlyPlayedGames/v0001/');
     recentUrl.searchParams.set('key', apiKey); recentUrl.searchParams.set('steamid', steamId);
-    const [ownedResp, recentResp] = await Promise.all([fetchWithTimeout(ownedUrl, {}, 25_000), fetchWithTimeout(recentUrl, {}, 25_000)]);
+    const [ownedResp, recentResp, profile] = await Promise.all([fetchWithTimeout(ownedUrl, {}, 25_000), fetchWithTimeout(recentUrl, {}, 25_000), fetchSteamProfile(steamId).catch(() => ({ steamid: steamId }))]);
     if (!ownedResp.ok) throw new Error(`Steam HTTP ${ownedResp.status}`);
     const ownedData = await ownedResp.json();
     const recentData = recentResp.ok ? await recentResp.json() : {};
@@ -242,7 +330,7 @@ app.get('/steam-games', async (req, res) => {
     // Achievements are intentionally concurrent but bounded so Railway does not stall on large libraries.
     const games = await mapWithConcurrency(baseGames, 6, async g => ({ ...g, ...await fetchAchievements(steamId, g.appid) }));
     games.sort((a, b) => b.playtime_forever - a.playtime_forever);
-    return res.json({ games, count: games.length, achievementsSynced: true });
+    return res.json({ games, count: games.length, achievementsSynced: true, profile });
   } catch (e) {
     return res.status(502).json({ error: 'Unable to fetch Steam library', detail: e.message || 'Unknown error' });
   }
